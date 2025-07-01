@@ -234,21 +234,29 @@ class Reproject:
             WCS parameters
 
         """
-        return {
+
+
+        params = {
             "crpix": torch.tensor(
-                wcs.wcs.crpix, dtype=torch.float64, device=self.device
+            wcs.wcs.crpix, dtype=torch.float64, device=self.device
             ),
             "crval": torch.tensor(
-                wcs.wcs.crval, dtype=torch.float64, device=self.device
+            wcs.wcs.crval, dtype=torch.float64, device=self.device
             ),
             "pc_matrix": torch.tensor(
-                wcs.wcs.get_pc(), dtype=torch.float64, device=self.device
+            wcs.wcs.get_pc(), dtype=torch.float64, device=self.device
             ),
             "cdelt": torch.tensor(
-                wcs.wcs.cdelt, dtype=torch.float64, device=self.device
+            wcs.wcs.cdelt, dtype=torch.float64, device=self.device
             ),
             "sip_coeffs": get_sip_coeffs(wcs),
+            "ctype": wcs.wcs.ctype if hasattr(wcs.wcs, "ctype") else None,
         }
+        # Only add heliocentric info if CTYPE1 is HPLN-TAN
+        if hasattr(wcs.wcs, "ctype") and wcs.wcs.ctype[0].upper() == "HPLN-TAN":
+            params["HGLT_OBS"] = torch.tensor(wcs.wcs.aux.hglt_obs, dtype=torch.float64, device=self.device)
+            params["HGLN_OBS"] = torch.tensor(wcs.wcs.aux.hgln_obs, dtype=torch.float64, device=self.device)
+        return params
 
     def _prepare_batch_wcs_params(self, source_hdus: Union[List[PrimaryHDU], List[TensorHDU]]) -> List[dict]:
         """
@@ -432,6 +440,8 @@ class Reproject:
             pc_matrix = source_wcs_params["pc_matrix"]
             cdelt = source_wcs_params["cdelt"]
             sip_coeffs = source_wcs_params["sip_coeffs"]
+            # Print HGLN and HGLA (assume present in WCS parameters)
+            print("HGLN_OBS:", source_wcs_params["HGLN_OBS"].item(), "HGLT_OBS:", source_wcs_params["HGLT_OBS"].item())
             # Extract this batch's RA and Dec
             ra = batch_ra[b]
             dec = batch_dec[b]
