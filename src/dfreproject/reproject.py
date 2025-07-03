@@ -256,6 +256,13 @@ class Reproject:
         if hasattr(wcs.wcs, "ctype") and wcs.wcs.ctype[0].upper() == "HPLN-TAN":
             params["HGLT_OBS"] = torch.tensor(wcs.wcs.aux.hglt_obs, dtype=torch.float64, device=self.device)
             params["HGLN_OBS"] = torch.tensor(wcs.wcs.aux.hgln_obs, dtype=torch.float64, device=self.device)
+            params["dsun_obs"] = torch.tensor(wcs.wcs.aux.dsun_obs, dtype=torch.float64, device=self.device)
+            if hasattr(wcs.wcs.aux, "rsun_ref") and wcs.wcs.aux.rsun_ref is not None:
+                params["rsun_ref"] = torch.tensor(wcs.wcs.aux.rsun_ref, dtype=torch.float64, device=self.device)
+            else:
+                params["rsun_ref"] = torch.tensor(
+                    6.9634e5, dtype=torch.float64, device=self.device
+                )
         return params
 
     def _prepare_batch_wcs_params(self, source_hdus: Union[List[PrimaryHDU], List[TensorHDU]]) -> List[dict]:
@@ -410,6 +417,153 @@ class Reproject:
         dec = torch.rad2deg(dec_rad)
 
         return ra, dec
+    
+    def calculate_sourceCoords_Heliocentric(self):
+        """
+        Calculate source image pixel coordinates corresponding to each target image pixel.
+
+        This function repeats the same steps in self.calculate_skyCoords() except in the opposite order and with the source coordinate wcs.
+
+        Returns
+        -------
+        torch.Tensor
+            Batch of source image pixel coordinates
+        """
+        # Get batch of sky coordinates
+        batch_ra, batch_dec = self.calculate_skyCoords()
+        B, H, W = batch_ra.shape
+
+        # Prepare to collect results for each source image
+        batch_x_pixel = torch.zeros((B, H, W), dtype=torch.float64, device=self.device)
+        batch_y_pixel = torch.zeros((B, H, W), dtype=torch.float64, device=self.device)
+
+        # Process each source image's coordinates
+        for b in range(B):
+            # Get WCS parameters for this specific source image
+            source_wcs_params = self.batch_source_wcs_params[b]
+            # Unpack WCS parameters
+            crpix = source_wcs_params["crpix"]
+            crval = source_wcs_params["crval"]
+            pc_matrix = source_wcs_params["pc_matrix"]
+            cdelt = source_wcs_params["cdelt"]
+            sip_coeffs = source_wcs_params["sip_coeffs"]
+            # Unpack heliocentric parameters
+            target_hglt_obs = self.target_wcs_params.get("HGLT_OBS")
+            target_hgln_obs = self.target_wcs_params.get("HGLN_OBS")
+            target_dsun_obs = self.target_wcs_params.get("dsun_obs")
+            target_rsun_ref = source_wcs_params.get("rsun_ref", 6.9634e5)  # Default to 696340 km if not provided
+
+            # Extract this batch's RA and Dec
+            ra = batch_ra[b]
+            dec = batch_dec[b]
+
+
+            # Conversion calculations
+            ra_rad = torch.deg2rad(ra)
+            dec_rad = torch.deg2rad(dec)
+            ra0_rad = crval[0] * torch.pi / 180.0
+            dec0_rad = crval[1] * torch.pi / 180.0
+            # Convert numpy arrays to torch tensors if needed
+            if not isinstance(ra, torch.Tensor):
+                ra = torch.tensor(ra, device=self.device)
+                dec = torch.tensor(dec, device=self.device)
+            # Step 1: Convert from world to native spherical coordinates
+            # Calculate the difference in RA
+            theta_y= ra_rad - ra0_rad
+            # Normalize theta_y to [-pi, pi]
+            theta_y = (theta_y + torch.pi) % (2 * torch.pi) - torch.pi
+            
+            theta_x = dec_rad - dec0_rad
+
+            theta_r = torch.sqrt(theta_x**2 + theta_y**2)
+        
+            
+            # Calculate sine and cosine values
+            sin_theta_r = torch.sin(theta_r)
+            
+             # Distance from observer to feature along the line of sight for each pixel using the law of sines
+    
+            sin_alpha = (target_dsun_obs / target_rsun_ref) * sin_theta_r
+            alpha = torch.arcsin(sin_alpha)
+
+            alpha = torch.pi - alpha
+            phi = torch.pi - alpha - theta_r
+            sin_phi = torch.sin(phi)
+
+            # distance_to_feature = torch.full_like(theta_r, float('nan'))
+            distance_to_feature = target_rsun_ref * sin_phi / sin_theta_r
+
+            x_heliocentric = distance_to_feature * torch.cos(theta_y) * torch.sin(theta_x)
+            y_heliocentric = distance_to_feature * torch.sin(theta_y)
+            z_heliocentric = target_dsun_obs - distance_to_feature * torch.cos(theta_y) * torch.cos(theta_x)
+            import matplotlib.pyplot as plt
+
+            # Visualize x_heliocentric, y_heliocentric, z_heliocentric for this batch
+            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+            im0 = axs[0].imshow(x_heliocentric.cpu().numpy(), origin='lower')
+            axs[0].set_title('x_heliocentric')
+            plt.colorbar(im0, ax=axs[0])
+            im1 = axs[1].imshow(y_heliocentric.cpu().numpy(), origin='lower')
+            axs[1].set_title('y_heliocentric')
+            plt.colorbar(im1, ax=axs[1])
+            im2 = axs[2].imshow(z_heliocentric.cpu().numpy(), origin='lower')
+            axs[2].set_title('z_heliocentric')
+            plt.colorbar(im2, ax=axs[2])
+            plt.tight_layout()
+            plt.show()
+            
+            pts_helio = torch.stack([x_heliocentric, y_heliocentric, z_heliocentric], dim=-1)  # shape (H, W, 3)
+
+
+
+            x_scaled = -r * sin_phi  # Note the negative sign
+            y_scaled = r * cos_phi
+            # Step 3: Apply the inverse of the CD matrix to get pixel offsets
+            # First, construct the CD matrix
+            CD_matrix = pc_matrix * cdelt
+            # Calculate the inverse of the CD matrix
+            CD_inv = torch.linalg.inv(CD_matrix)
+            # Handle batch processing for arrays
+            if ra.dim() == 0:  # scalar inputs
+                standard_coords = torch.tensor(
+                    [x_scaled.item(), y_scaled.item()],
+                    device=self.device,
+                    dtype=torch.float64,
+                )
+                pixel_offsets = torch.matmul(CD_inv, standard_coords)
+                u = pixel_offsets[0]
+                v = pixel_offsets[1]
+            else:  # array inputs
+                # Reshape for batch processing if needed
+                if ra.dim() > 1:
+                    original_shape = ra.shape
+                    x_scaled_flat = x_scaled.reshape(-1)
+                    y_scaled_flat = y_scaled.reshape(-1)
+                else:
+                    x_scaled_flat = x_scaled
+                    y_scaled_flat = y_scaled
+                # Stack for batch matrix multiplication
+                standard_coords = torch.stack(
+                    [x_scaled_flat, y_scaled_flat], dim=1
+                )  # Shape: [N, 2]
+                # Use batch matrix multiplication
+                pixel_offsets = torch.matmul(standard_coords, CD_inv.T)  # Shape: [N, 2]
+                u = pixel_offsets[:, 0]
+                v = pixel_offsets[:, 1]
+                # Reshape back to original dimensions if needed
+                if ra.dim() > 1:
+                    u = u.reshape(original_shape)
+                    v = v.reshape(original_shape)
+            if sip_coeffs is not None:
+                u, v = apply_inverse_sip_distortion(u, v, sip_coeffs, self.device)
+            # Step 4: Add the reference pixel to get final pixel coordinates
+            # Remember to add (CRPIX-1) to account for 1-based indexing in FITS/WCS
+            x_pixel = u + (crpix[0] - 1)
+            y_pixel = v + (crpix[1] - 1)
+            batch_x_pixel[b] = x_pixel
+            batch_y_pixel[b] = y_pixel
+
+        return batch_x_pixel, batch_y_pixel 
 
     def calculate_sourceCoords(self):
         """
@@ -440,8 +594,6 @@ class Reproject:
             pc_matrix = source_wcs_params["pc_matrix"]
             cdelt = source_wcs_params["cdelt"]
             sip_coeffs = source_wcs_params["sip_coeffs"]
-            # Print HGLN and HGLA (assume present in WCS parameters)
-            print("HGLN_OBS:", source_wcs_params["HGLN_OBS"].item(), "HGLT_OBS:", source_wcs_params["HGLT_OBS"].item())
             # Extract this batch's RA and Dec
             ra = batch_ra[b]
             dec = batch_dec[b]
@@ -583,8 +735,11 @@ class Reproject:
         extended sources, as it properly preserves both the background noise
         characteristics and the flux distribution of sources.
         """
-        # Get source coordinates
-        x_source, y_source = self.calculate_sourceCoords()
+        # Get source coordinates)
+        if(self.batch_source_wcs_params[0]["ctype"][0].upper() == "HPLN-TAN"):
+            x_source, y_source = self.calculate_sourceCoords_Heliocentric()
+        else:
+            x_source, y_source = self.calculate_sourceCoords()
         B, H, W = self.batch_source_images.shape
         # Normalize coordinates
         x_normalized = 2.0 * (x_source / (W - 1)) - 1.0
