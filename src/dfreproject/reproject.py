@@ -453,6 +453,12 @@ class Reproject:
             target_dsun_obs = self.target_wcs_params.get("dsun_obs")
             target_rsun_ref = source_wcs_params.get("rsun_ref", 6.9634e5)  # Default to 696340 km if not provided
 
+            source_hglt_obs = source_wcs_params.get("HGLT_OBS")
+            source_hgln_obs = source_wcs_params.get("HGLN_OBS")
+            source_dsun_obs = source_wcs_params.get("dsun_obs")
+            source_rsun_ref = source_wcs_params.get("rsun_ref", 6.9634e5)  # Default to 696340 km if not provided
+
+
             # Extract this batch's RA and Dec
             ra = batch_ra[b]
             dec = batch_dec[b]
@@ -469,11 +475,11 @@ class Reproject:
                 dec = torch.tensor(dec, device=self.device)
             # Step 1: Convert from world to native spherical coordinates
             # Calculate the difference in RA
-            theta_y= ra_rad - ra0_rad
+            theta_x= ra_rad - ra0_rad
             # Normalize theta_y to [-pi, pi]
-            theta_y = (theta_y + torch.pi) % (2 * torch.pi) - torch.pi
-            
-            theta_x = dec_rad - dec0_rad
+            theta_x = (theta_x + torch.pi) % (2 * torch.pi) - torch.pi
+
+            theta_y = dec_rad - dec0_rad
 
             theta_r = torch.sqrt(theta_x**2 + theta_y**2)
         
@@ -496,23 +502,66 @@ class Reproject:
             x_heliocentric = distance_to_feature * torch.cos(theta_y) * torch.sin(theta_x)
             y_heliocentric = distance_to_feature * torch.sin(theta_y)
             z_heliocentric = target_dsun_obs - distance_to_feature * torch.cos(theta_y) * torch.cos(theta_x)
-            import matplotlib.pyplot as plt
-
-            # Visualize x_heliocentric, y_heliocentric, z_heliocentric for this batch
-            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-            im0 = axs[0].imshow(x_heliocentric.cpu().numpy(), origin='lower')
-            axs[0].set_title('x_heliocentric')
-            plt.colorbar(im0, ax=axs[0])
-            im1 = axs[1].imshow(y_heliocentric.cpu().numpy(), origin='lower')
-            axs[1].set_title('y_heliocentric')
-            plt.colorbar(im1, ax=axs[1])
-            im2 = axs[2].imshow(z_heliocentric.cpu().numpy(), origin='lower')
-            axs[2].set_title('z_heliocentric')
-            plt.colorbar(im2, ax=axs[2])
-            plt.tight_layout()
-            plt.show()
             
             pts_helio = torch.stack([x_heliocentric, y_heliocentric, z_heliocentric], dim=-1)  # shape (H, W, 3)
+
+            # Step 2: Rotate by target_hglt_obs about the x axis (latitude rotation)
+            # target_hglt_obs is in degrees, convert to radians
+            
+            theta = torch.deg2rad(target_hglt_obs)
+            cos_theta = torch.cos(theta)
+            sin_theta = torch.sin(theta)
+            # Rotation matrix for x-axis
+            rot_x = torch.tensor([
+                [1, 0, 0],
+                [0, cos_theta, -sin_theta],
+                [0, sin_theta, cos_theta]
+            ], dtype=torch.float64, device=self.device)
+            # pts_helio: (H, W, 3) -> (H*W, 3)
+            pts_helio_flat = pts_helio.reshape(-1, 3)
+            pts_rot = torch.matmul(pts_helio_flat, rot_x.T)
+            pts_rot = pts_rot.reshape(*pts_helio.shape)
+
+
+            # Step 2.6: Rotate by the difference in longitude between source and target about the y axis
+            # Both target_hgln_obs and source_hgln_obs are in degrees, convert to radians
+            delta_longitude = torch.deg2rad(target_hgln_obs - source_hgln_obs)
+            cos_delta = torch.cos(delta_longitude)
+            sin_delta = torch.sin(delta_longitude)
+            # Rotation matrix for y-axis
+            rot_y = torch.tensor([
+                [cos_delta, 0, sin_delta],
+                [0,         1, 0],
+                [-sin_delta, 0, cos_delta]
+            ], dtype=torch.float64, device=self.device)
+            # Apply y-rotation
+            pts_rot = torch.matmul(pts_rot, rot_y.T)
+
+            # Step 2.7: Rotate by source_hglt_obs about the x axis (latitude rotation)
+            theta_src = -torch.deg2rad(source_hglt_obs)
+            cos_theta_src = torch.cos(theta_src)
+            sin_theta_src = torch.sin(theta_src)
+            rot_x_src = torch.tensor([
+                [1, 0, 0],
+                [0, cos_theta_src, -sin_theta_src],
+                [0, sin_theta_src, cos_theta_src]
+            ], dtype=torch.float64, device=self.device)
+            pts_rot = torch.matmul(pts_rot, rot_x_src.T)
+
+
+           
+            # Step 2.5: Visualize x, y, z heliocentric coordinates using matplotlib
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].imshow(pts_rot[..., 0].cpu().numpy(), origin='lower', cmap='viridis')
+            axes[0].set_title('Heliocentric X')
+            axes[1].imshow(pts_rot[..., 1].cpu().numpy(), origin='lower', cmap='viridis')
+            axes[1].set_title('Heliocentric Y')
+            axes[2].imshow(pts_rot[..., 2].cpu().numpy(), origin='lower', cmap='viridis')
+            axes[2].set_title('Heliocentric Z')
+            plt.tight_layout()
+            plt.show()
 
 
 
