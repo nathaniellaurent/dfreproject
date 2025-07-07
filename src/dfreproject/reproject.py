@@ -259,9 +259,10 @@ class Reproject:
             params["dsun_obs"] = torch.tensor(wcs.wcs.aux.dsun_obs, dtype=torch.float64, device=self.device)
             if hasattr(wcs.wcs.aux, "rsun_ref") and wcs.wcs.aux.rsun_ref is not None:
                 params["rsun_ref"] = torch.tensor(wcs.wcs.aux.rsun_ref, dtype=torch.float64, device=self.device)
+                print(f"Using rsun_ref from WCS: {params['rsun_ref']}")
             else:
                 params["rsun_ref"] = torch.tensor(
-                    6.9634e5, dtype=torch.float64, device=self.device
+                    6.957e8, dtype=torch.float64, device=self.device
                 )
         return params
 
@@ -451,14 +452,16 @@ class Reproject:
             target_hglt_obs = self.target_wcs_params.get("HGLT_OBS")
             target_hgln_obs = self.target_wcs_params.get("HGLN_OBS")
             target_dsun_obs = self.target_wcs_params.get("dsun_obs")
-            target_rsun_ref = source_wcs_params.get("rsun_ref", 6.9634e5)  # Default to 696340 km if not provided
+            target_rsun_ref = self.target_wcs_params.get("rsun_ref")  # Default to 696340 km if not provided
+
 
             source_hglt_obs = source_wcs_params.get("HGLT_OBS")
             source_hgln_obs = source_wcs_params.get("HGLN_OBS")
             source_dsun_obs = source_wcs_params.get("dsun_obs")
-            source_rsun_ref = source_wcs_params.get("rsun_ref", 6.9634e5)  # Default to 696340 km if not provided
+            source_rsun_ref = source_wcs_params.get("rsun_ref")  # Default to 696340 km if not provided
 
-
+            print(f"Target rsun_ref: {target_rsun_ref}")
+            print(f"Source rsun_ref: {source_rsun_ref}")
             # Extract this batch's RA and Dec
             ra = batch_ra[b]
             dec = batch_dec[b]
@@ -507,8 +510,19 @@ class Reproject:
 
             # Step 2: Rotate by target_hglt_obs about the x axis (latitude rotation)
             # target_hglt_obs is in degrees, convert to radians
+
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            axes[0].imshow(pts_helio[..., 0].cpu().numpy(), origin='lower', cmap='viridis')
+            axes[0].set_title('Heliocentric X before')
+            axes[1].imshow(pts_helio[..., 1].cpu().numpy(), origin='lower', cmap='viridis')
+            axes[1].set_title('Heliocentric Y')
+            axes[2].imshow(pts_helio[..., 2].cpu().numpy(), origin='lower', cmap='viridis')
+            axes[2].set_title('Heliocentric Z')
+            plt.tight_layout()
             
-            theta = torch.deg2rad(target_hglt_obs)
+            theta = -torch.deg2rad(target_hglt_obs)
             cos_theta = torch.cos(theta)
             sin_theta = torch.sin(theta)
             # Rotation matrix for x-axis
@@ -517,10 +531,7 @@ class Reproject:
                 [0, cos_theta, -sin_theta],
                 [0, sin_theta, cos_theta]
             ], dtype=torch.float64, device=self.device)
-            # pts_helio: (H, W, 3) -> (H*W, 3)
-            pts_helio_flat = pts_helio.reshape(-1, 3)
-            pts_rot = torch.matmul(pts_helio_flat, rot_x.T)
-            pts_rot = pts_rot.reshape(*pts_helio.shape)
+           
 
 
             # Step 2.6: Rotate by the difference in longitude between source and target about the y axis
@@ -534,11 +545,9 @@ class Reproject:
                 [0,         1, 0],
                 [-sin_delta, 0, cos_delta]
             ], dtype=torch.float64, device=self.device)
-            # Apply y-rotation
-            pts_rot = torch.matmul(pts_rot, rot_y.T)
 
             # Step 2.7: Rotate by source_hglt_obs about the x axis (latitude rotation)
-            theta_src = -torch.deg2rad(source_hglt_obs)
+            theta_src = torch.deg2rad(source_hglt_obs)
             cos_theta_src = torch.cos(theta_src)
             sin_theta_src = torch.sin(theta_src)
             rot_x_src = torch.tensor([
@@ -546,7 +555,10 @@ class Reproject:
                 [0, cos_theta_src, -sin_theta_src],
                 [0, sin_theta_src, cos_theta_src]
             ], dtype=torch.float64, device=self.device)
-            pts_rot = torch.matmul(pts_rot, rot_x_src.T)
+
+            R = rot_x_src @ rot_y @ rot_x  # Combined rotation matrix
+
+            pts_rot = torch.einsum('ij,hwj->hwi', R, pts_helio)
 
 
            
@@ -561,12 +573,37 @@ class Reproject:
             axes[2].imshow(pts_rot[..., 2].cpu().numpy(), origin='lower', cmap='viridis')
             axes[2].set_title('Heliocentric Z')
             plt.tight_layout()
-            plt.show()
+
+            # Create a mask where the Z heliocentric coordinate is negative
+            z_negative_mask = pts_rot[..., 2] < 0
+
+            # Extract the rotated coordinates
+            x_heliocentric = pts_rot[..., 0]
+            y_heliocentric = pts_rot[..., 1]
+            z_heliocentric = pts_rot[..., 2]
+
+            obs_distance_to_feature = torch.sqrt(x_heliocentric**2 + y_heliocentric**2 + (source_dsun_obs - z_heliocentric)**2)
+            # theta_x_new: arg(D - z, x) = arctan2(x, D - z)
+            theta_x_new = torch.atan2(x_heliocentric, source_dsun_obs - z_heliocentric)
+            # theta_y_new: arcsin(y / d_proj)
+            theta_y_new = torch.asin(y_heliocentric / obs_distance_to_feature)
+            
+            # Set masked points (where Z heliocentric coordinate is negative) to NaN
+            theta_x_new = theta_x_new.masked_fill(z_negative_mask, float('nan'))
+            theta_y_new = theta_y_new.masked_fill(z_negative_mask, float('nan'))
+
+            # Visualize theta_x_new and theta_y_new using matplotlib without stretch
+            fig2, axes2 = plt.subplots(1, 2, figsize=(12, 5))
+            axes2[0].imshow(theta_x_new.cpu().numpy(), origin='lower', cmap='twilight')
+            axes2[0].set_title('Theta X (new)')
+            axes2[1].imshow(theta_y_new.cpu().numpy(), origin='lower', cmap='twilight')
+            axes2[1].set_title('Theta Y (new)')
+            plt.tight_layout()
 
 
 
-            x_scaled = -r * sin_phi  # Note the negative sign
-            y_scaled = r * cos_phi
+            x_scaled = theta_x_new * 180.0 / torch.pi
+            y_scaled = theta_y_new * 180.0 / torch.pi
             # Step 3: Apply the inverse of the CD matrix to get pixel offsets
             # First, construct the CD matrix
             CD_matrix = pc_matrix * cdelt
@@ -611,6 +648,15 @@ class Reproject:
             y_pixel = v + (crpix[1] - 1)
             batch_x_pixel[b] = x_pixel
             batch_y_pixel[b] = y_pixel
+            # Display x_pixel and y_pixel using matplotlib
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+            axes[0].imshow(x_pixel.cpu().numpy(), origin='lower', cmap='viridis')
+            axes[0].set_title('x_pixel')
+            axes[1].imshow(y_pixel.cpu().numpy(), origin='lower', cmap='viridis')
+            axes[1].set_title('y_pixel')
+            plt.tight_layout()
 
         return batch_x_pixel, batch_y_pixel 
 
@@ -795,6 +841,15 @@ class Reproject:
         y_normalized = 2.0 * (y_source / (H - 1)) - 1.0
         # Create sampling grid
         grid = torch.stack([x_normalized, y_normalized], dim=-1)
+        import matplotlib.pyplot as plt
+
+        # Visualize the sampling grid (show x and y normalized coordinates)
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].imshow(x_normalized[0].cpu().numpy(), origin='lower', cmap='twilight')
+        axes[0].set_title('x_normalized')
+        axes[1].imshow(y_normalized[0].cpu().numpy(), origin='lower', cmap='twilight')
+        axes[1].set_title('y_normalized')
+        plt.tight_layout()
         # Prepare images and grid for grid_sample
         source_images = self.batch_source_images.unsqueeze(1)  # [B, 1, H, W]
         ones = torch.ones_like(source_images)
