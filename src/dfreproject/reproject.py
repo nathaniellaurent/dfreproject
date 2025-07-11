@@ -373,10 +373,10 @@ class Reproject:
         transformed = torch.bmm(
             pixel_offsets, CD_matrix.T.unsqueeze(0).expand(B, -1, -1)
         )
-
+        del pixel_offsets, CD_matrix, u, v
         x_scaled = transformed[:, :, 0].reshape(B, H, W)
         y_scaled = transformed[:, :, 1].reshape(B, H, W)
-
+        del transformed
         # Compute radial distance
         r = torch.sqrt(x_scaled**2 + y_scaled**2)
         r0 = torch.tensor(180.0 / torch.pi, device=self.device)
@@ -387,35 +387,35 @@ class Reproject:
         phi[non_zero_r] = torch.rad2deg(
             torch.atan2(-x_scaled[non_zero_r], y_scaled[non_zero_r])
         )
-
+        del x_scaled, y_scaled
         # Compute theta
-        theta = torch.rad2deg(torch.atan2(r0, r))
+        #theta = torch.rad2deg(torch.atan2(r0, r))
 
         # Convert to radians
         phi_rad = torch.deg2rad(phi)
-        theta_rad = torch.deg2rad(theta)
+        theta_rad = torch.deg2rad(torch.rad2deg(torch.atan2(r0, r)))
+        del r0, r
         ra0_rad = crval[0] * torch.pi / 180.0
         dec0_rad = crval[1] * torch.pi / 180.0
 
         # Spherical coordinate calculations
-        sin_theta = torch.sin(theta_rad)
-        cos_theta = torch.cos(theta_rad)
-        sin_phi = torch.sin(phi_rad)
-        cos_phi = torch.cos(phi_rad)
-        sin_dec0 = torch.sin(dec0_rad)
-        cos_dec0 = torch.cos(dec0_rad)
+        # sin_theta = torch.sin(theta_rad)
+        # cos_theta = torch.cos(theta_rad)
+        # sin_phi = torch.sin(phi_rad)
+        # cos_phi = torch.cos(phi_rad)
+        # sin_dec0 = torch.sin(dec0_rad)
+        # cos_dec0 = torch.cos(dec0_rad)
 
-        sin_dec = sin_theta * sin_dec0 + cos_theta * cos_dec0 * cos_phi
+        sin_dec = torch.sin(theta_rad) * torch.sin(dec0_rad) + torch.cos(theta_rad) * torch.cos(dec0_rad) * torch.cos(phi_rad)
         dec_rad = torch.arcsin(sin_dec)
-
-        y_term = cos_theta * sin_phi
-        x_term = sin_theta * cos_dec0 - cos_theta * sin_dec0 * cos_phi
-        ra_rad = ra0_rad + torch.atan2(-y_term, x_term)
-
+        #del sin_dec
+        # y_term = torch.cos(theta_rad) * torch.sin(phi_rad)
+        # x_term = torch.sin(theta_rad) * torch.cos(dec0_rad) - torch.cos(theta_rad) * torch.sin(dec0_rad) * torch.cos(phi_rad)
+        ra_rad = ra0_rad + torch.atan2(-torch.cos(theta_rad) * torch.sin(phi_rad), torch.sin(theta_rad) * torch.cos(dec0_rad) - torch.cos(theta_rad) * torch.sin(dec0_rad) * torch.cos(phi_rad))
         # Convert to degrees and normalize
         ra = torch.rad2deg(ra_rad) % 360.0
         dec = torch.rad2deg(dec_rad)
-
+        del ra_rad, dec_rad
         return ra, dec
     
     def calculate_sourceCoords_Heliocentric(self):
@@ -468,12 +468,14 @@ class Reproject:
             # Conversion calculations
             ra_rad = torch.deg2rad(ra)
             dec_rad = torch.deg2rad(dec)
+            ra_dim = ra.dim()
+            ra_shape = ra.shape
+            del ra, dec
             ra0_rad = crval[0] * torch.pi / 180.0
             dec0_rad = crval[1] * torch.pi / 180.0
             # Convert numpy arrays to torch tensors if needed
-            if not isinstance(ra, torch.Tensor):
-                ra = torch.tensor(ra, device=self.device)
-                dec = torch.tensor(dec, device=self.device)
+            # if not isinstance(ra, torch.Tensor):
+            #     ra = torch.tensor(ra, device=self.device)
             # Step 1: Convert from world to native spherical coordinates
             # Calculate the difference in RA
             theta_x= ra_rad - ra0_rad
@@ -806,31 +808,31 @@ class Reproject:
         x_normalized = 2.0 * (x_source / (W - 1)) - 1.0
         y_normalized = 2.0 * (y_source / (H - 1)) - 1.0
         # Create sampling grid
-        grid = torch.stack([x_normalized, y_normalized], dim=-1)
-
+        #grid = torch.stack([x_normalized, y_normalized], dim=-1)
         # Prepare images and grid for grid_sample
         source_images = self.batch_source_images.unsqueeze(1)  # [B, 1, H, W]
         ones = torch.ones_like(source_images)
         # Combine images with ones for footprint calculation
-        combined = torch.cat([source_images, ones], dim=1)  # [B, 2, H, W]
+        #combined = torch.cat([source_images, ones], dim=1)  # [B, 2, H, W]
         # Single grid_sample call
-        combined_result = interpolate_image(combined, grid, interpolation_mode)
+        combined_result = interpolate_image(torch.cat([source_images, ones], dim=1), torch.stack([x_normalized, y_normalized], dim=-1), interpolation_mode)
+        del source_images, ones, x_normalized, y_normalized
         # Split the results
-        resampled_image = combined_result[:, 0].squeeze()
-        resampled_footprint = combined_result[:, 1].squeeze()
+        #resampled_image = combined_result[:, 0].squeeze()
+        #resampled_footprint = combined_result[:, 1].squeeze()
         # Create output array initialized with zeros
-        result = torch.full_like(resampled_image, torch.nan)
+        result = torch.full_like(combined_result[:, 0].squeeze(), torch.nan)
         # Apply footprint correction only where footprint is significant
-        valid_pixels = resampled_footprint > EPSILON
+        valid_pixels = combined_result[:, 1].squeeze() > EPSILON
         # Apply footprint correction only where footprint is significant
         if torch.any(valid_pixels):
             # Normalize by the footprint where valid
             result[valid_pixels] = (
-                resampled_image[valid_pixels] / resampled_footprint[valid_pixels]
+                combined_result[:, 0].squeeze()[valid_pixels] / combined_result[:, 1].squeeze()[valid_pixels]
             )
         else:
             logger.warning("No valid pixels found in footprint! Using raw interpolated values")
-
+        del valid_pixels
         return result
 
 
@@ -969,12 +971,12 @@ def calculate_reprojection(
                              num_threads=num_threads,
                              requires_grad=requires_grad)
     order = validate_interpolation_order(order)
-    input_type = source_hdus[0].data[0][0].dtype
+    #input_type = source_hdus[0].data[0][0].dtype
 
     if(requires_grad):
         result = reprojection.interpolate_source_image(interpolation_mode=order).cpu()
     else:
-        result = reprojection.interpolate_source_image(interpolation_mode=order).cpu().numpy().astype(input_type)
+        result = reprojection.interpolate_source_image(interpolation_mode=order).cpu().numpy().astype(np.float32)
 
 
     torch.cuda.empty_cache()

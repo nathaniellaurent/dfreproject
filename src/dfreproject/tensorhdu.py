@@ -16,11 +16,11 @@ class TensorHDU(PrimaryHDU):
         scale_back=None,
     ):
         """
-        Construct a pytorch tensor HDU.
+        Construct a pytorch tensor HDU (Child class of PrimaryHDU with added tensor property).
 
         Parameters
         ----------
-        data : array or ``astropy.io.fits.hdu.base.DELAYED``, optional
+        data : Pytorch tensor, array or ``astropy.io.fits.hdu.base.DELAYED``, optional
             The data in the HDU.
 
         header : `~astropy.io.fits.Header`, optional
@@ -86,6 +86,11 @@ class TensorHDU(PrimaryHDU):
                     data = torch.tensor(data, requires_grad = True)
             except Exception:
                 data = torch.tensor(data, requires_grad = True)
+        elif isinstance(data, torch.Tensor):
+            if data.dtype != torch.float64:
+                data = data.to(torch.float64)
+
+                
 
         self.__dict__["tensor"] = data
 
