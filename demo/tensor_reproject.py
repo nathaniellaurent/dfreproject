@@ -1,6 +1,5 @@
 import sys
 sys.path.append('src')  # Adds the parent directory to the Python path
-print(sys.path)
 from astropy.io import fits
 from astropy.wcs import WCS
 from dfreproject import calculate_reprojection
