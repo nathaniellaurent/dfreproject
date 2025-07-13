@@ -171,15 +171,19 @@ class Reproject:
 
         self.requires_grad = requires_grad
 
+        if source_hdus is not None:
+            self.batch_source_images = self._prepare_source_images(source_hdus)
 
-        self.batch_source_images = self._prepare_source_images(source_hdus)
+            # Initialize the WCS objects
+            self.batch_source_wcs_params = self._prepare_batch_wcs_params(source_hdus)
 
-        # Initialize the WCS objects
-        self.batch_source_wcs_params = self._prepare_batch_wcs_params(source_hdus)
         self.target_wcs_params = self._extract_wcs_params(target_wcs)
 
         # Define target grid
-        self.target_grid = self._create_batch_target_grid(shape_out)
+        if source_hdus is not None:
+            self.target_grid = self._create_batch_target_grid(shape_out)
+
+        self.shape_out = shape_out
 
 
     def _prepare_source_images(self, source_hdus: List[PrimaryHDU]) -> torch.Tensor:
@@ -216,6 +220,7 @@ class Reproject:
                 for hdu in source_hdus
             ]
         return torch.stack(source_images)
+    
 
     def _extract_wcs_params(self, wcs: WCS) -> dict:
         """
@@ -834,6 +839,67 @@ class Reproject:
             logger.warning("No valid pixels found in footprint! Using raw interpolated values")
         del valid_pixels
         return result
+    
+    def image_to_rays(self):
+        # Get source coordinates
+        H, W = self.shape_out
+        y_grid, x_grid = torch.meshgrid(
+            torch.arange(H, dtype=torch.float64, device=self.device),
+            torch.arange(W, dtype=torch.float64, device=self.device),
+            indexing="ij"
+        )
+        ra, dec = self.calculate_skyCoords(x_grid=x_grid, y_grid=y_grid)
+
+        ra_rad = torch.deg2rad(ra)
+        dec_rad = torch.deg2rad(dec)
+
+        x = torch.sin(ra_rad) * torch.cos(dec_rad)
+        y = torch.sin(dec_rad)
+        z = -torch.cos(ra_rad) * torch.cos(dec_rad)
+
+        rays = torch.stack([x, y, z], dim=-1)  # Shape: [B, H, W, 3]
+
+        dsun_obs = self.target_wcs_params.get("dsun_obs")
+        hglt = self.target_wcs_params.get("HGLT_OBS")
+        hgln = self.target_wcs_params.get("HGLN_OBS")
+
+        
+        
+        obs = torch.tensor([0.0, 0.0, dsun_obs], dtype=torch.float64, device=self.device)
+
+        # Rotate rays to heliocentric coordinates
+        if hglt is not None and hgln is not None:
+            # Convert to radians
+            hglt_rad = torch.deg2rad(hglt)
+            hgln_rad = torch.deg2rad(hgln)
+
+            # Rotation matrix for heliocentric coordinates
+            
+            # This is a rotation matrix for a right-handed (counterclockwise, CCW) rotation
+            # around the x-axis by angle hglt_rad.
+            R_hglt = torch.tensor([
+                [1, 0, 0],
+                [0, torch.cos(hglt_rad), -torch.sin(hglt_rad)],
+                [0, torch.sin(hglt_rad), torch.cos(hglt_rad)]
+            ], dtype=torch.float64, device=self.device)
+
+            # This is a rotation matrix for a right-handed (counterclockwise, CCW) rotation
+            # around the y-axis by angle hgln_rad.
+            R_hgln = torch.tensor([
+                [torch.cos(hgln_rad), 0, torch.sin(hgln_rad)],
+                [0, 1, 0],
+                [-torch.sin(hgln_rad), 0, torch.cos(hgln_rad)]
+            ], dtype=torch.float64, device=self.device)
+
+            obs = obs @ (R_hglt @ R_hgln).T
+
+            rays = rays @ (R_hglt @ R_hgln).T
+        
+
+        return obs, rays
+        
+        # return result
+
 
 
 def calculate_reprojection(
@@ -977,6 +1043,35 @@ def calculate_reprojection(
         result = reprojection.interpolate_source_image(interpolation_mode=order).cpu()
     else:
         result = reprojection.interpolate_source_image(interpolation_mode=order).cpu().numpy().astype(np.float32)
+
+
+    torch.cuda.empty_cache()
+    return result
+
+
+def calculate_rays(
+    source_wcs: Union[WCS, Header],
+    shape_out: Optional[Tuple[int, int]] = None,
+    device: str = None,
+    num_threads: int = None,
+    requires_grad: bool = False
+):
+
+   
+
+    # Convert Header to WCS if needed
+    if isinstance(source_wcs, Header):
+        source_wcs = WCS(source_wcs)
+    reprojection = Reproject(source_hdus=None,
+                             target_wcs=source_wcs,
+                             shape_out=shape_out,
+                             device=device,
+                             num_threads=num_threads,
+                             requires_grad=requires_grad)
+
+    
+    result = reprojection.image_to_rays()
+
 
 
     torch.cuda.empty_cache()
