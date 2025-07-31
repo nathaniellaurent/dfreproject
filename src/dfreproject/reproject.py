@@ -243,30 +243,30 @@ class Reproject:
 
         params = {
             "crpix": torch.tensor(
-            wcs.wcs.crpix, dtype=torch.float64, device=self.device
+            wcs.wcs.crpix, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad
             ),
             "crval": torch.tensor(
-            wcs.wcs.crval, dtype=torch.float64, device=self.device
+            wcs.wcs.crval, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad
             ),
             "pc_matrix": torch.tensor(
-            wcs.wcs.get_pc(), dtype=torch.float64, device=self.device
+            wcs.wcs.get_pc(), dtype=torch.float64, device=self.device, requires_grad=self.requires_grad
             ),
             "cdelt": torch.tensor(
-            wcs.wcs.cdelt, dtype=torch.float64, device=self.device
+            wcs.wcs.cdelt, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad
             ),
             "sip_coeffs": get_sip_coeffs(wcs),
             "ctype": wcs.wcs.ctype if hasattr(wcs.wcs, "ctype") else None,
         }
         # Only add heliocentric info if CTYPE1 is HPLN-TAN
         if hasattr(wcs.wcs, "ctype") and wcs.wcs.ctype[0].upper() == "HPLN-TAN":
-            params["HGLT_OBS"] = torch.tensor(wcs.wcs.aux.hglt_obs, dtype=torch.float64, device=self.device)
-            params["HGLN_OBS"] = torch.tensor(wcs.wcs.aux.hgln_obs, dtype=torch.float64, device=self.device)
-            params["dsun_obs"] = torch.tensor(wcs.wcs.aux.dsun_obs, dtype=torch.float64, device=self.device)
+            params["HGLT_OBS"] = torch.tensor(wcs.wcs.aux.hglt_obs, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
+            params["HGLN_OBS"] = torch.tensor(wcs.wcs.aux.hgln_obs, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
+            params["dsun_obs"] = torch.tensor(wcs.wcs.aux.dsun_obs, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
             if hasattr(wcs.wcs.aux, "rsun_ref") and wcs.wcs.aux.rsun_ref is not None:
-                params["rsun_ref"] = torch.tensor(wcs.wcs.aux.rsun_ref, dtype=torch.float64, device=self.device)
+                params["rsun_ref"] = torch.tensor(wcs.wcs.aux.rsun_ref, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
             else:
                 params["rsun_ref"] = torch.tensor(
-                    6.957e8, dtype=torch.float64, device=self.device
+                    6.957e8, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad
                 )
         return params
 
@@ -300,12 +300,12 @@ class Reproject:
 
         # Create meshgrid and repeat for batch
         y_grid = (
-            torch.arange(H, dtype=torch.float64, device=self.device)
+            torch.arange(H, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
             .view(1, -1, 1)
             .repeat(B, 1, W)
         )
         x_grid = (
-            torch.arange(W, dtype=torch.float64, device=self.device)
+            torch.arange(W, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
             .view(1, 1, -1)
             .repeat(B, H, 1)
         )
@@ -343,9 +343,9 @@ class Reproject:
         else:
             # Ensure x and y are tensors on the correct device
             if not isinstance(x_grid, torch.Tensor):
-                x_grid = torch.tensor(x_grid, dtype=torch.float64, device=self.device)
+                x_grid = torch.tensor(x_grid, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
             if not isinstance(y_grid, torch.Tensor):
-                y_grid = torch.tensor(y_grid, dtype=torch.float64, device=self.device)
+                y_grid = torch.tensor(y_grid, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad)
 
             # Ensure consistent batch dimensions
             if x_grid.dim() == 2:
@@ -840,14 +840,26 @@ class Reproject:
         del valid_pixels
         return result
     
-    def image_to_rays(self):
+    def image_to_rays(self, corners):
         # Get source coordinates
         H, W = self.shape_out
-        y_grid, x_grid = torch.meshgrid(
-            torch.arange(H, dtype=torch.float64, device=self.device),
-            torch.arange(W, dtype=torch.float64, device=self.device),
-            indexing="ij"
-        )
+        if not corners:
+            y_grid, x_grid = torch.meshgrid(
+                torch.arange(H, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad),
+                torch.arange(W, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad),
+                indexing="ij"
+            )
+        else:
+            y_grid = (
+                torch.arange(H + 1, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad) - 0.5
+            )
+            x_grid = (
+                torch.arange(W + 1, dtype=torch.float64, device=self.device, requires_grad=self.requires_grad) - 0.5
+            )
+            y_grid, x_grid = torch.meshgrid(y_grid, x_grid, indexing="ij")
+
+
+
         ra, dec = self.calculate_skyCoords(x_grid=x_grid, y_grid=y_grid)
 
         ra_rad = torch.deg2rad(ra)
@@ -879,8 +891,8 @@ class Reproject:
             # around the x-axis by angle hglt_rad.
             R_hglt = torch.tensor([
                 [1, 0, 0],
-                [0, torch.cos(hglt_rad), -torch.sin(hglt_rad)],
-                [0, torch.sin(hglt_rad), torch.cos(hglt_rad)]
+                [0, torch.cos(-hglt_rad), -torch.sin(-hglt_rad)],
+                [0, torch.sin(-hglt_rad), torch.cos(-hglt_rad)]
             ], dtype=torch.float64, device=self.device)
 
             # This is a rotation matrix for a right-handed (counterclockwise, CCW) rotation
@@ -1054,6 +1066,7 @@ def calculate_rays(
     shape_out: Optional[Tuple[int, int]] = None,
     device: str = None,
     num_threads: int = None,
+    corners = False,
     requires_grad: bool = False
 ):
 
@@ -1070,7 +1083,7 @@ def calculate_rays(
                              requires_grad=requires_grad)
 
     
-    result = reprojection.image_to_rays()
+    result = reprojection.image_to_rays(corners=corners)
 
 
 
